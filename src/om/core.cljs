@@ -6,7 +6,7 @@
   (:require [om.dom :as dom :include-macros true]))
 
 (def ^{:tag boolean :dynamic true} *read-enabled* false)
-
+(def ^:dynamic dependent-tree {})
 ;; =============================================================================
 ;; React Life Cycle Protocols
 ;;
@@ -130,6 +130,11 @@
                       props-state))
           (aset props "__om_state" nil))))))
 
+(defn ^:private get-react-component-path [component]
+  (clojure.string/split (subs (aget component "_rootNodeID") 1) #"\."))
+
+(declare unregister-component)
+
 (def ^:private Pure
   (js/React.createClass
     #js {:getInitialState
@@ -168,6 +173,8 @@
 
                      (not (== (aget props "__om_index") (aget next-props "__om_index")))
                      true
+                     (get-in dependent-tree (get-react-component-path this))
+                     true
 
                      :else false))))))
          :componentWillMount
@@ -187,7 +194,10 @@
          :componentWillUnmount
          (fn []
            (this-as this
-             (let [c (children this)]
+             (let [c (children this)
+                   subscriptions (aget this "path-dependencies")]
+               (doseq [subscription subscriptions]
+                 (unregister-component this subscription))
                (when (satisfies? IWillUnmount c)
                  (allow-reads (will-unmount c))))))
          :componentWillUpdate
@@ -415,11 +425,13 @@
 ;; API
 
 (def ^:private refresh-queued false)
-(def ^:private refresh-set (atom #{}))
+(def ^:private refresh-set (atom {}))
+
+ (declare get-dependent-tree)
 
 (defn ^:private render-all []
   (set! refresh-queued false)
-  (doseq [f @refresh-set] (f)))
+  (doseq [[f old-value] @refresh-set] (f old-value)))
 
 (def ^:private roots (atom {}))
 
@@ -450,19 +462,20 @@
     (let [state (if (instance? Atom value)
                   value
                   (atom value))
-          rootf (fn rootf []
-                  (swap! refresh-set disj rootf)
+          rootf (fn rootf [old-value]
+                  (swap! refresh-set dissoc rootf)
                   (let [value  @state
                         cursor (to-cursor value state [] shared)]
-                    (dom/render
-                      (pure #js {:__om_cursor cursor}
-                        (fn [this] (allow-reads (f cursor this))))
-                      target)))
+                    (binding [dependent-tree (get-dependent-tree old-value value)]
+                      (dom/render
+                        (pure #js {:__om_cursor cursor}
+                              (fn [this] (allow-reads (f cursor this))))
+                        target))))
           watch-key (gensym)]
       (add-watch state watch-key
-        (fn [_ _ _ _]
+        (fn [_ _ old-value _]
           (when-not (contains? @refresh-set rootf)
-            (swap! refresh-set conj rootf))
+            (swap! refresh-set assoc rootf old-value))
           (when-not refresh-queued
             (set! refresh-queued true)
             (if (exists? js/requestAnimationFrame)
@@ -474,7 +487,7 @@
           (remove-watch state watch-key)
           (swap! roots dissoc target)
           (js/React.unmountComponentAtNode target)))
-      (rootf))))
+      (rootf @state))))
 
 (defn ^:private valid? [m]
   (every? #{:key :react-key :fn :init-state :state :opts ::index} (keys m)))
@@ -613,6 +626,51 @@
         (to-cursor (get-in value korks) state
           (if (vector? korks) korks (into [] korks))
           shared)))))
+
+(def ^:private component-dep-tree (atom {}))
+;;nested maps made from cursor paths to the dependent components
+;;@todo optimize multiple root case
+
+(defn ^:private make-tree-from-paths [paths]
+  (loop [acc {} paths paths]
+    (if (seq paths)
+      (recur (update-in acc (first paths) merge {}) (rest paths))
+      acc)))
+
+(defn ^:private get-dependent-paths ""
+  [path-deps old new-state]
+  (mapcat (fn [[k v]]
+            (if (= ::dependent-components k)
+              (map get-react-component-path v)
+              (let [subold (get old k)
+                    subnew (get new-state k)]
+                (if (and v (not= subold subnew))
+                  (get-dependent-paths v subold subnew)
+                  ()))))
+          path-deps))
+
+(defn ^:private get-dependent-tree
+  ([old new-state]
+   (make-tree-from-paths (get-dependent-paths @component-dep-tree old new-state))))
+
+(defn register-dependency
+  "EXPERIMENTAL: Registers a component to rerender when the state changes at the cursor path"
+  [owner cursor]
+  (let [p (path cursor)]
+    (if-let [subscriptions (aget owner "path-dependencies")]
+      (aset owner "path-dependencies" (conj subscriptions cursor))
+      (aset owner "path-dependencies" #{cursor}))
+    (swap! component-dep-tree update-in (conj p ::dependent-components) (fnil conj #{}) owner))
+  )
+(defn unregister-dependency
+  "EXPERIMENTAL: Unregisters a component from rerendering on state changes at the cursor path"
+  [owner cursor]
+  (let [p (path cursor)]
+    (let [subscriptions (aget owner "path-dependencies")]
+      (aset owner "path-dependencies" (when subscriptions (disj subscriptions cursor)))
+      (when (empty? (remove #(= (path %) p) subscriptions))
+        (swap! component-dep-tree update-in (conj p ::dependent-components) disj owner))))
+  )
 
 (defn get-node
   "A helper function to get at React refs. Given a owning pure node
